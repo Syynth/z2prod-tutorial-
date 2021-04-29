@@ -1,25 +1,70 @@
-use sqlx::{Connection, PgConnection};
 use std::net::TcpListener;
-use zero2prod::configuration::get_configuration;
+
+use sqlx::{Connection, Executor, PgConnection, PgPool};
+use uuid::Uuid;
+
+use zero2prod::configuration::{get_configuration, DatabaseSettings};
 use zero2prod::startup::run;
+use zero2prod::telemetry::{get_subscriber, init_subscriber};
 
-fn spawn_app() -> String {
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+lazy_static::lazy_static! {
+    static ref TRACING: () = {
+        let filter = if std::env::var("TEST_LOG").is_ok() { "debug" } else { "" };
+        init_subscriber(get_subscriber("test".into(), filter.into()));
+    };
+}
+
+async fn spawn_app() -> TestApp {
+    lazy_static::initialize(&TRACING);
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
-
     let port = listener.local_addr().unwrap().port();
-    let server = run(listener).expect("Failed to bind address");
-    let _ = tokio::spawn(server);
+    let address = format!("http://127.0.0.1:{}", port);
+    let mut cfg = get_configuration().expect("Failed to read configuration");
 
-    format!("http://127.0.0.1:{}", port)
+    cfg.database.database_name = Uuid::new_v4().to_string();
+
+    let connection_pool = configure_database(&cfg.database).await;
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+
+async fn configure_database(config: &DatabaseSettings) -> PgPool {
+    let mut connection = PgConnection::connect(&config.connection_string_without_db())
+        .await
+        .expect("Failed to connect to Postgres");
+    connection
+        .execute(&*format!(r#"CREATE DATABASE "{}";"#, config.database_name))
+        .await
+        .expect("Failed to create database");
+    let connection_pool = PgPool::connect(&config.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+    sqlx::migrate!("./migrations")
+        .run(&connection_pool)
+        .await
+        .expect("Failed to migrate database");
+
+    connection_pool
 }
 
 #[actix_rt::test]
 async fn health_check_works() {
-    let address = spawn_app();
+    let app = spawn_app().await;
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/health_check", &address))
+        .get(&format!("{}/health_check", &app.address))
         .send()
         .await
         .expect("Failed to execute request");
@@ -30,7 +75,7 @@ async fn health_check_works() {
 
 #[actix_rt::test]
 async fn subscribe_returns_200_for_valid_form_data() {
-    let app_address = spawn_app();
+    let app = spawn_app().await;
     let cfg = get_configuration().expect("Failed to read configuration");
     let connection_string = cfg.database.connection_string();
     let mut connection = PgConnection::connect(&connection_string)
@@ -41,7 +86,7 @@ async fn subscribe_returns_200_for_valid_form_data() {
     let body = "name=bilbo%20baggins&email=bilbo%40gmail.com";
 
     let response = client
-        .post(&format!("{}/subscriptions", &app_address))
+        .post(&format!("{}/subscriptions", &app.address))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -61,7 +106,7 @@ async fn subscribe_returns_200_for_valid_form_data() {
 
 #[actix_rt::test]
 async fn subscribe_returns_400_for_missing_form_data() {
-    let app_address = spawn_app();
+    let app = spawn_app().await;
     let client = reqwest::Client::new();
     let test_cases = vec![
         ("name=bilbo%20baggins", "missing email"),
@@ -71,7 +116,7 @@ async fn subscribe_returns_400_for_missing_form_data() {
 
     for (invalid_body, error_message) in test_cases {
         let response = client
-            .post(&format!("{}/subscriptions", &app_address))
+            .post(&format!("{}/subscriptions", &app.address))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(invalid_body)
             .send()
