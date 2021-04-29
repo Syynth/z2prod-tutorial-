@@ -76,6 +76,8 @@ jobs:
           override: true
 
       - name: Run cargo-tarpaulin
+        env:
+          SQLX_OFFLINE: true
         uses: actions-rs/tarpaulin@v0.1
         with:
           args: '--ignore-tests'

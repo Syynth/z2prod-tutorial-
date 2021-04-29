@@ -1,4 +1,3 @@
-use actix_web;
 use sqlx::PgPool;
 use std::net::TcpListener;
 
