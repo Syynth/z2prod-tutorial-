@@ -1,9 +1,9 @@
 use std::io::Result;
 use std::net::TcpListener;
 
-use sqlx::PgPool;
 use actix_web::dev::Server;
 use actix_web::{web, App, HttpServer};
+use sqlx::PgPool;
 use tracing_actix_web::TracingLogger;
 
 use crate::routes::*;
